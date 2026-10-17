@@ -3,8 +3,6 @@ package com.hfrtest;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
-import android.content.ClipData;
-import android.content.ClipboardManager;
 import android.content.ContentValues;
 import android.content.pm.PackageManager;
 import android.graphics.Rect;
@@ -22,12 +20,12 @@ import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.MediaMetadataRetriever;
 import android.media.MediaRecorder;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.util.Range;
 import android.util.Size;
@@ -39,7 +37,6 @@ import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -48,60 +45,30 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * HFR Lab v3: menjalankan serangkaian tes otomatis (120/240 FPS, EV, manual, tanpa preview,
- * sesi biasa, HEVC) lalu menampilkan ringkasan satu baris per tes.
+ * HFR Recorder v4: rekam 720p 120 FPS (high-speed). Shutter ditampilkan langsung;
+ * atur cahaya / EV sampai shutter sesuai, tekan KUNCI, lalu video tetap konsisten.
  */
 public class MainActivity extends Activity {
 
-    private static final int REC_SECONDS = 4;
-    private static final long MANUAL_EXPOSURE_NS = 1_000_000L; // 1/1000 s
-    private static final int MANUAL_ISO = 800;
-
-    private static final int M_AUTO = 0;
-    private static final int M_EV = 1;
-    private static final int M_CTRLOFF = 2;
-    private static final int M_NORMAL_MANUAL = 3;
-
-    private static class TestCase {
-        final String id, title;
-        final boolean hs, preview, hevc;
-        final int fps, mode;
-
-        TestCase(String id, String title, boolean hs, int fps, boolean preview, boolean hevc, int mode) {
-            this.id = id;
-            this.title = title;
-            this.hs = hs;
-            this.fps = fps;
-            this.preview = preview;
-            this.hevc = hevc;
-            this.mode = mode;
-        }
-    }
-
-    private final List<TestCase> tests = new ArrayList<TestCase>();
-    private int testIndex = 0;
-    private TestCase cur;
-    private int token = 0;
-    private volatile boolean running = false;
-    private volatile boolean testActive = false;
-    private final StringBuilder report = new StringBuilder();
+    private static final int FPS = 120;
+    private static final int MAX_SECONDS = 30;
 
     private CameraManager manager;
     private HandlerThread camThread;
     private Handler camHandler;
 
     private SurfaceView surfaceView;
-    private TextView logView;
+    private TextView liveView, logView, tvEv;
     private ScrollView scroll;
-    private Button btnRun, btnCopy, btnInfo;
+    private Button btnRec, btnLock, btnEvMinus, btnEvPlus;
 
     private String camId;
     private CameraCharacteristics chars;
     private Size recSize;
     private Range<Integer> recRange;
-    private int targetFps = 120;
-    private long requestedExpNs = 0;
-    private String note = "";
+    private int evIdx = 0;
+    private int evMin = -20;
+    private int evMax = 10;
 
     private CameraDevice cameraDevice;
     private CameraCaptureSession session;
@@ -112,6 +79,15 @@ public class MainActivity extends Activity {
     private Surface prevSurface, recSurface;
     private CameraCaptureSession.CaptureCallback captureCb;
 
+    private volatile boolean recording = false;
+    private volatile boolean live = false;
+    private volatile boolean locked = false;
+    private volatile long lastExp = -1;
+    private volatile long lastIso = -1;
+    private long lastUi = 0;
+    private int lockIdx = -1;
+    private int token = 0;
+
     // tiap elemen: {sensorTimestampNs, exposureNs, iso}
     private final List<long[]> frames = Collections.synchronizedList(new ArrayList<long[]>());
 
@@ -121,16 +97,6 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-
-        tests.add(new TestCase("T1", "HS 120 FPS AUTO (pembanding)", true, 120, true, false, M_AUTO));
-        tests.add(new TestCase("T2", "HS 120 FPS EV minimum (shutter via kompensasi)", true, 120, true, false, M_EV));
-        tests.add(new TestCase("T3", "HS 120 FPS CONTROL_MODE_OFF manual 1/1000", true, 120, true, false, M_CTRLOFF));
-        tests.add(new TestCase("T4", "HS 120 FPS tanpa preview", true, 120, false, false, M_AUTO));
-        tests.add(new TestCase("T5", "SESI BIASA manual 1/1000 (bukan high-speed)", false, 120, false, false, M_NORMAL_MANUAL));
-        tests.add(new TestCase("T6", "HS 240 FPS preview + HEVC", true, 240, true, true, M_AUTO));
-        tests.add(new TestCase("T7", "HS 240 FPS tanpa preview H264", true, 240, false, false, M_AUTO));
-        tests.add(new TestCase("T8", "HS 240 FPS tanpa preview HEVC", true, 240, false, true, M_AUTO));
-
         buildUi();
 
         camThread = new HandlerThread("cam");
@@ -144,8 +110,16 @@ public class MainActivity extends Activity {
                 Long ts = res.get(CaptureResult.SENSOR_TIMESTAMP);
                 Long ex = res.get(CaptureResult.SENSOR_EXPOSURE_TIME);
                 Integer iso = res.get(CaptureResult.SENSOR_SENSITIVITY);
-                if (ts != null) {
-                    frames.add(new long[]{ts, ex == null ? -1 : ex, iso == null ? -1 : iso});
+                if (ts == null) return;
+                long e = ex == null ? -1 : ex;
+                long i = iso == null ? -1 : iso;
+                frames.add(new long[]{ts, e, i});
+                lastExp = e;
+                lastIso = i;
+                long now = SystemClock.elapsedRealtime();
+                if (now - lastUi > 250) {
+                    lastUi = now;
+                    updateLive();
                 }
             }
         };
@@ -169,8 +143,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        running = false;
-        testActive = false;
+        live = false;
+        recording = false;
         cleanup();
         if (camThread != null) camThread.quitSafely();
     }
@@ -189,16 +163,37 @@ public class MainActivity extends Activity {
         right.setPadding(16, 16, 16, 16);
         root.addView(right, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
 
-        btnRun = makeButton("JALANKAN SEMUA TES (sekitar 2 menit)");
-        btnCopy = makeButton("Salin laporan");
-        btnInfo = makeButton("Cek kemampuan kamera");
-        right.addView(btnRun);
-        right.addView(btnCopy);
-        right.addView(btnInfo);
+        liveView = new TextView(this);
+        liveView.setTypeface(Typeface.MONOSPACE);
+        liveView.setTextSize(20);
+        liveView.setText("Tekan MULAI REKAM.\nShutter akan tampil di sini.");
+        right.addView(liveView);
 
-        btnRun.setOnClickListener(v -> runAll());
-        btnCopy.setOnClickListener(v -> copyReport());
-        btnInfo.setOnClickListener(v -> camHandler.post(() -> dumpInfo()));
+        LinearLayout evRow = new LinearLayout(this);
+        evRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnEvMinus = makeButton("EV -");
+        btnEvPlus = makeButton("EV +");
+        tvEv = new TextView(this);
+        tvEv.setTextSize(16);
+        tvEv.setGravity(android.view.Gravity.CENTER);
+        evRow.addView(btnEvMinus, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        evRow.addView(tvEv, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
+        evRow.addView(btnEvPlus, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        right.addView(evRow);
+
+        btnRec = makeButton("MULAI REKAM");
+        btnLock = makeButton("KUNCI exposure sekarang");
+        btnLock.setEnabled(false);
+        right.addView(btnRec);
+        right.addView(btnLock);
+
+        btnRec.setOnClickListener(v -> {
+            if (!recording) startRecording();
+            else camHandler.post(() -> finishRecording());
+        });
+        btnLock.setOnClickListener(v -> toggleLock());
+        btnEvMinus.setOnClickListener(v -> changeEv(-5));
+        btnEvPlus.setOnClickListener(v -> changeEv(5));
 
         scroll = new ScrollView(this);
         logView = new TextView(this);
@@ -210,6 +205,7 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
         setContentView(root);
+        setUi();
     }
 
     private Button makeButton(String text) {
@@ -219,11 +215,29 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    private void setButtons(final boolean enabled) {
+    private void setUi() {
         runOnUiThread(() -> {
-            btnRun.setEnabled(enabled);
-            btnInfo.setEnabled(enabled);
+            btnRec.setText(recording ? "STOP" : "MULAI REKAM");
+            btnLock.setEnabled(live);
+            btnLock.setText(locked ? "BUKA KUNCI" : "KUNCI exposure sekarang");
+            btnEvMinus.setEnabled(!locked);
+            btnEvPlus.setEnabled(!locked);
+            tvEv.setText(String.format(Locale.US, "EV %.1f", evIdx / 10.0));
         });
+    }
+
+    private void updateLive() {
+        final long e = lastExp;
+        final long i = lastIso;
+        final boolean lk = locked;
+        final String s;
+        if (e > 0) {
+            s = String.format(Locale.US, "SHUTTER 1/%d s\n(%.2f ms)\nISO %d\n%s",
+                    Math.round(1e9 / e), e / 1e6, i, lk ? "[TERKUNCI]" : "[AUTO]");
+        } else {
+            s = "menunggu data kamera...";
+        }
+        runOnUiThread(() -> liveView.setText(s));
     }
 
     private void log(final String s) {
@@ -233,98 +247,26 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void clearLog() {
-        runOnUiThread(() -> logView.setText(""));
-    }
-
-    private void copyReport() {
-        ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        cm.setPrimaryClip(ClipData.newPlainText("laporan HFR", logView.getText().toString()));
-        Toast.makeText(this, "Laporan disalin. Tempel ke Claude.", Toast.LENGTH_SHORT).show();
-    }
-
-    // ------------------------------------------------------- info & seleksi
+    // ----------------------------------------------------------- persiapan
 
     private void init() {
         camHandler.post(() -> {
-            log("HFR Lab v3");
-            dumpInfo();
-            selectFor(120);
+            if (selectConfig()) {
+                log("Siap: kamera " + camId + ", " + recSize + " @ " + FPS + " FPS (high-speed).");
+                log("Cara pakai: arahkan ke objek, tekan MULAI REKAM, atur cahaya/EV sampai shutter sesuai,");
+                log("tekan KUNCI, lalu lanjutkan. Bagian video sebelum kunci dibuang saat analisis.");
+            } else {
+                log("Kamera belakang tidak mendukung high-speed " + FPS + " FPS.");
+            }
         });
     }
 
-    private static String yn(boolean b) { return b ? "YA" : "TIDAK"; }
-
-    private static String levelName(Integer lv) {
-        if (lv == null) return "?";
-        switch (lv) {
-            case CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY: return "LEGACY";
-            case CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED: return "LIMITED";
-            case CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_FULL: return "FULL";
-            case CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_3: return "LEVEL_3";
-            case CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL: return "EXTERNAL";
-            default: return String.valueOf(lv);
-        }
-    }
-
-    private void dumpInfo() {
-        try {
-            log("Perangkat: " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE);
-            for (String id : manager.getCameraIdList()) {
-                CameraCharacteristics c = manager.getCameraCharacteristics(id);
-                Integer facing = c.get(CameraCharacteristics.LENS_FACING);
-                boolean back = facing != null && facing == CameraCharacteristics.LENS_FACING_BACK;
-                log("== Kamera " + id + (back ? " (belakang)" : " (depan/lain)"));
-                log("Level: " + levelName(c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)));
-
-                boolean manualSensor = false, highSpeed = false;
-                int[] caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
-                if (caps != null) {
-                    for (int cap : caps) {
-                        if (cap == CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) manualSensor = true;
-                        if (cap == CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO) highSpeed = true;
-                    }
-                }
-                log("MANUAL_SENSOR: " + yn(manualSensor) + " | HIGH_SPEED: " + yn(highSpeed));
-                log("EV range: " + c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
-                        + " langkah " + c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP));
-
-                StreamConfigurationMap map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                if (map != null && back) {
-                    try {
-                        long md = map.getOutputMinFrameDuration(MediaRecorder.class, new Size(1280, 720));
-                        if (md > 0) {
-                            log(String.format(Locale.US,
-                                    "Sesi biasa 720p: durasi frame minimum %.2f ms (maks %.1f FPS)", md / 1e6, 1e9 / md));
-                        }
-                    } catch (Exception e) {
-                        log("Sesi biasa 720p min frame duration: " + e);
-                    }
-                }
-                Size[] hs = map == null ? null : map.getHighSpeedVideoSizes();
-                if (hs == null || hs.length == 0) {
-                    log("Ukuran high-speed: TIDAK ADA");
-                } else {
-                    for (Size s : hs) {
-                        Range<Integer>[] rs = map.getHighSpeedVideoFpsRangesFor(s);
-                        log("High-speed " + s + " : " + Arrays.toString(rs));
-                    }
-                }
-            }
-            log("");
-        } catch (Exception e) {
-            log("Error cek kemampuan: " + e);
-        }
-    }
-
-    /** -1 = tidak ada, 0 = siap, 1 = ukuran preview berubah. */
-    private int selectFor(int fps) {
+    private boolean selectConfig() {
         try {
             Size bestSize = null;
             Range<Integer> bestRange = null;
             String bestId = null;
             CameraCharacteristics bestChars = null;
-            long bestScore = Long.MAX_VALUE;
 
             for (String id : manager.getCameraIdList()) {
                 CameraCharacteristics c = manager.getCameraCharacteristics(id);
@@ -335,148 +277,84 @@ public class MainActivity extends Activity {
                 Size[] sizes = map.getHighSpeedVideoSizes();
                 if (sizes == null) continue;
                 for (Size s : sizes) {
+                    if (!(s.getWidth() == 1280 && s.getHeight() == 720)) continue;
                     Range<Integer>[] ranges = map.getHighSpeedVideoFpsRangesFor(s);
                     Range<Integer> pick = null;
                     for (Range<Integer> r : ranges) {
-                        if (r.getUpper() == fps && (pick == null || r.getLower() > pick.getLower())) {
+                        if (r.getUpper() == FPS && (pick == null || r.getLower() > pick.getLower())) {
                             pick = r;
                         }
                     }
-                    if (pick == null) continue;
-                    boolean is720 = s.getWidth() == 1280 && s.getHeight() == 720;
-                    long score = is720 ? 0L : (long) s.getWidth() * s.getHeight();
-                    if (score < bestScore) {
-                        bestScore = score;
-                        bestSize = s;
-                        bestRange = pick;
-                        bestId = id;
-                        bestChars = c;
+                    if (pick != null) {
+                        bestSize = s; bestRange = pick; bestId = id; bestChars = c;
                     }
                 }
             }
+            if (bestSize == null) return false;
 
-            if (bestSize == null) {
-                log("Tidak ada mode high-speed " + fps + " FPS di kamera belakang.");
-                return -1;
-            }
-            boolean sizeChanged = recSize == null || !recSize.equals(bestSize);
             camId = bestId;
             chars = bestChars;
             recSize = bestSize;
             recRange = bestRange;
-            targetFps = fps;
 
-            if (sizeChanged) {
-                final Size fs = recSize;
-                runOnUiThread(() -> surfaceView.getHolder().setFixedSize(fs.getWidth(), fs.getHeight()));
-                return 1;
+            Range<Integer> evr = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+            if (evr != null) {
+                evMin = Math.max(evr.getLower(), -20);
+                evMax = Math.min(evr.getUpper(), 10);
             }
-            return 0;
+            final Size fs = recSize;
+            runOnUiThread(() -> surfaceView.getHolder().setFixedSize(fs.getWidth(), fs.getHeight()));
+            return true;
         } catch (Exception e) {
             log("Error memilih konfigurasi: " + e);
-            return -1;
+            return false;
         }
     }
 
-    // --------------------------------------------------------- jalankan tes
+    // ------------------------------------------------------------- merekam
 
-    private void runAll() {
-        if (running) return;
+    private void startRecording() {
         if (recSize == null) {
-            log("Belum ada konfigurasi high-speed. Tekan 'Cek kemampuan kamera' dulu.");
+            log("Belum siap. Tunggu sebentar.");
             return;
         }
         Rect fr = surfaceView.getHolder().getSurfaceFrame();
         if (!surfaceView.getHolder().getSurface().isValid()
                 || fr.width() != recSize.getWidth() || fr.height() != recSize.getHeight()) {
-            log("Preview belum siap (" + fr.width() + "x" + fr.height() + "). Tunggu 2 detik lalu tekan lagi.");
+            log("Preview belum siap. Tunggu 2 detik lalu tekan lagi.");
             return;
         }
-        running = true;
-        setButtons(false);
-        report.setLength(0);
-        testIndex = 0;
-        clearLog();
-        camHandler.post(() -> {
-            log("HFR Lab v3 - MULAI SEMUA TES");
-            log("Arahkan HP ke tempat TERANG dan tahan stabil sampai selesai.");
-            dumpInfo();
-            selectFor(120);
-            nextTest();
-        });
-    }
-
-    private void nextTest() {
-        if (!running) return;
-        if (testIndex >= tests.size()) {
-            finishAll();
-            return;
-        }
-        cur = tests.get(testIndex++);
-        log("[" + testIndex + "/" + tests.size() + "] " + cur.id + " " + cur.title);
+        recording = true;
+        locked = false;
+        lockIdx = -1;
+        lastExp = -1;
         frames.clear();
-        note = "";
-        requestedExpNs = 0;
-        testActive = true;
         token++;
-        final int t = token;
-        camHandler.postDelayed(() -> {
-            if (testActive && token == t) endTest("GAGAL: waktu habis (tes macet)", true);
-        }, 20000);
-
-        targetFps = cur.fps;
-        if (cur.hs) {
-            int r = selectFor(cur.fps);
-            if (r < 0) { endTest("GAGAL: tidak ada mode high-speed " + cur.fps + " FPS", true); return; }
-            if (r == 1) { endTest("GAGAL: ukuran preview berubah, ulangi", true); return; }
-        }
-        openCameraAndRecord();
-    }
-
-    private void finishAll() {
-        log("");
-        log("=== RINGKASAN ===");
-        log(report.toString());
-        log("=== SELESAI. Tekan 'Salin laporan' lalu tempel ke Claude ===");
-        running = false;
-        setButtons(true);
-    }
-
-    private void endTest(String line, boolean deleteVideo) {
-        if (!testActive) return;
-        testActive = false;
-        token++;
-        Uri u = videoUri;
-        cleanup();
-        if (deleteVideo && u != null) {
-            try { getContentResolver().delete(u, null, null); } catch (Exception ignored) { }
-        }
-        String full = cur.id + " | " + line;
-        report.append(full).append("\n");
-        log(">> " + full);
-        camHandler.postDelayed(() -> nextTest(), 3000);
+        setUi();
+        log("--- Mulai (maks " + MAX_SECONDS + " detik) ---");
+        camHandler.post(() -> openCamera());
     }
 
     @SuppressLint("MissingPermission")
-    private void openCameraAndRecord() {
+    private void openCamera() {
         try {
             manager.openCamera(camId, new CameraDevice.StateCallback() {
                 @Override public void onOpened(CameraDevice camera) {
-                    if (!testActive) { camera.close(); return; }
+                    if (!recording) { camera.close(); return; }
                     cameraDevice = camera;
                     createSession();
                 }
                 @Override public void onDisconnected(CameraDevice camera) {
                     camera.close();
-                    endTest("GAGAL: kamera terputus", true);
+                    fail("Kamera terputus.");
                 }
                 @Override public void onError(CameraDevice camera, int error) {
                     camera.close();
-                    endTest("GAGAL: error kamera kode " + error, true);
+                    fail("Error kamera kode " + error);
                 }
             }, camHandler);
         } catch (Exception e) {
-            endTest("GAGAL: openCamera: " + e, true);
+            fail("openCamera: " + e);
         }
     }
 
@@ -493,7 +371,7 @@ public class MainActivity extends Activity {
 
     private void prepareRecorder() throws Exception {
         ContentValues v = new ContentValues();
-        v.put(MediaStore.Video.Media.DISPLAY_NAME, "HFRLAB_" + cur.id + "_" + System.currentTimeMillis() + ".mp4");
+        v.put(MediaStore.Video.Media.DISPLAY_NAME, "HFR_" + System.currentTimeMillis() + ".mp4");
         v.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
         v.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/HFRTest");
         videoUri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
@@ -504,9 +382,9 @@ public class MainActivity extends Activity {
         recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
         recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
         recorder.setOutputFile(videoPfd.getFileDescriptor());
-        recorder.setVideoEncoder(cur.hevc ? MediaRecorder.VideoEncoder.HEVC : MediaRecorder.VideoEncoder.H264);
-        recorder.setVideoEncodingBitRate(cur.fps >= 240 ? 60_000_000 : 40_000_000);
-        recorder.setVideoFrameRate(cur.fps);
+        recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
+        recorder.setVideoEncodingBitRate(40_000_000);
+        recorder.setVideoFrameRate(FPS);
         recorder.setVideoSize(recSize.getWidth(), recSize.getHeight());
         recorder.setOrientationHint(orientHint());
         recorder.prepare();
@@ -514,132 +392,135 @@ public class MainActivity extends Activity {
 
     private void createSession() {
         try {
-            if (cur.preview && !surfaceView.getHolder().getSurface().isValid()) {
-                endTest("GAGAL: preview belum siap", true);
-                return;
-            }
             prepareRecorder();
-            prevSurface = cur.preview ? surfaceView.getHolder().getSurface() : null;
+            prevSurface = surfaceView.getHolder().getSurface();
             recSurface = recorder.getSurface();
-
-            if (cur.hs) {
-                List<Surface> outs = new ArrayList<Surface>();
-                if (prevSurface != null) outs.add(prevSurface);
-                outs.add(recSurface);
-                cameraDevice.createConstrainedHighSpeedCaptureSession(outs,
-                        new CameraCaptureSession.StateCallback() {
-                            @Override public void onConfigured(CameraCaptureSession s) {
-                                if (!testActive) return;
-                                session = s;
-                                hsSession = (CameraConstrainedHighSpeedCaptureSession) s;
-                                startHighSpeed();
-                            }
-                            @Override public void onConfigureFailed(CameraCaptureSession s) {
-                                endTest("GAGAL: sesi high-speed DITOLAK driver", true);
-                            }
-                        }, camHandler);
-            } else {
-                cameraDevice.createCaptureSession(Arrays.asList(recSurface),
-                        new CameraCaptureSession.StateCallback() {
-                            @Override public void onConfigured(CameraCaptureSession s) {
-                                if (!testActive) return;
-                                session = s;
-                                startNormal();
-                            }
-                            @Override public void onConfigureFailed(CameraCaptureSession s) {
-                                endTest("GAGAL: sesi biasa DITOLAK driver", true);
-                            }
-                        }, camHandler);
-            }
+            List<Surface> outs = Arrays.asList(prevSurface, recSurface);
+            cameraDevice.createConstrainedHighSpeedCaptureSession(outs,
+                    new CameraCaptureSession.StateCallback() {
+                        @Override public void onConfigured(CameraCaptureSession s) {
+                            if (!recording) return;
+                            session = s;
+                            hsSession = (CameraConstrainedHighSpeedCaptureSession) s;
+                            startBurst();
+                        }
+                        @Override public void onConfigureFailed(CameraCaptureSession s) {
+                            fail("Sesi high-speed ditolak driver.");
+                        }
+                    }, camHandler);
         } catch (Exception e) {
-            endTest("GAGAL: createSession: " + e, true);
+            fail("createSession: " + e);
         }
     }
 
-    private void setManualSensor(CaptureRequest.Builder b) {
-        long exp = MANUAL_EXPOSURE_NS;
-        Range<Long> er = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
-        if (er != null) exp = Math.max(er.getLower(), Math.min(er.getUpper(), exp));
-        int iso = MANUAL_ISO;
-        Range<Integer> ir = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
-        if (ir != null) iso = Math.max(ir.getLower(), Math.min(ir.getUpper(), iso));
-        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exp);
-        b.set(CaptureRequest.SENSOR_SENSITIVITY, iso);
-        b.set(CaptureRequest.SENSOR_FRAME_DURATION, 1_000_000_000L / cur.fps);
-        requestedExpNs = exp;
-        note = " | diminta exp " + exp / 1000 + "us ISO " + iso;
-    }
-
-    private void applyMode(CaptureRequest.Builder b) {
-        switch (cur.mode) {
-            case M_EV: {
-                Range<Integer> r = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
-                int ev = r == null ? 0 : r.getLower();
-                b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev);
-                note = " | diminta EV idx " + ev;
-                break;
-            }
-            case M_CTRLOFF:
-                b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_OFF);
-                b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF);
-                setManualSensor(b);
-                break;
-            case M_NORMAL_MANUAL:
-                b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF);
-                setManualSensor(b);
-                break;
-            default:
-                break;
+    private List<CaptureRequest> buildRequests() throws Exception {
+        CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+        b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, recRange);
+        b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
+        b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evIdx);
+        if (locked) {
+            b.set(CaptureRequest.CONTROL_AE_LOCK, true);
+            b.set(CaptureRequest.CONTROL_AWB_LOCK, true);
         }
+        b.addTarget(prevSurface);
+        b.addTarget(recSurface);
+        return hsSession.createHighSpeedRequestList(b.build());
     }
 
-    private void scheduleFinish() {
-        final int t = token;
-        camHandler.postDelayed(() -> {
-            if (testActive && token == t) finishCurrent();
-        }, REC_SECONDS * 1000L);
-    }
-
-    private void startHighSpeed() {
+    private void startBurst() {
         try {
-            CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
-            b.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, recRange);
-            b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
-            if (prevSurface != null) b.addTarget(prevSurface);
-            b.addTarget(recSurface);
-            applyMode(b);
-            List<CaptureRequest> list = hsSession.createHighSpeedRequestList(b.build());
-            hsSession.setRepeatingBurst(list, captureCb, camHandler);
+            hsSession.setRepeatingBurst(buildRequests(), captureCb, camHandler);
             recorder.start();
-            scheduleFinish();
+            live = true;
+            setUi();
+            log("Merekam. Atur cahaya/EV, lalu tekan KUNCI.");
+            final int t = token;
+            camHandler.postDelayed(() -> {
+                if (recording && live && token == t) {
+                    log("Batas " + MAX_SECONDS + " detik tercapai, berhenti otomatis.");
+                    finishRecording();
+                }
+            }, MAX_SECONDS * 1000L);
         } catch (Exception e) {
-            endTest("GAGAL: startHighSpeed: " + e, true);
+            fail("startBurst: " + e);
         }
     }
 
-    private void startNormal() {
-        try {
-            CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
-            b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                    CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
-            b.addTarget(recSurface);
-            applyMode(b);
-            session.setRepeatingRequest(b.build(), captureCb, camHandler);
-            recorder.start();
-            scheduleFinish();
-        } catch (Exception e) {
-            endTest("GAGAL: startNormal: " + e, true);
-        }
+    private void reissue() {
+        camHandler.post(() -> {
+            if (!live || hsSession == null) return;
+            try {
+                hsSession.setRepeatingBurst(buildRequests(), captureCb, camHandler);
+            } catch (Exception e) {
+                log("Gagal memperbarui pengaturan: " + e);
+            }
+        });
     }
 
-    private void finishCurrent() {
-        try { if (session != null) session.stopRepeating(); } catch (Exception e) { log("stopRepeating: " + e); }
-        try { recorder.stop(); } catch (RuntimeException e) { log("recorder.stop gagal: " + e); }
-        Uri uri = videoUri;
+    private void changeEv(int delta) {
+        evIdx = Math.max(evMin, Math.min(evMax, evIdx + delta));
+        setUi();
+        if (live) reissue();
+    }
+
+    private void toggleLock() {
+        camHandler.post(() -> {
+            if (!live || hsSession == null) return;
+            try {
+                locked = !locked;
+                if (locked) {
+                    lockIdx = frames.size();
+                    log("Exposure DIKUNCI pada shutter sekitar 1/"
+                            + (lastExp > 0 ? Math.round(1e9 / lastExp) : 0) + " s.");
+                } else {
+                    lockIdx = -1;
+                    log("Kunci dibuka (kembali otomatis).");
+                }
+                hsSession.setRepeatingBurst(buildRequests(), captureCb, camHandler);
+                setUi();
+                updateLive();
+            } catch (Exception e) {
+                log("Gagal mengubah kunci: " + e);
+            }
+        });
+    }
+
+    private void finishRecording() {
+        if (!recording) return;
+        token++;
+        boolean wasLive = live;
+        live = false;
+        if (wasLive) {
+            try { if (session != null) session.stopRepeating(); } catch (Exception e) { log("stopRepeating: " + e); }
+            try { recorder.stop(); } catch (RuntimeException e) { log("recorder.stop gagal: " + e); }
+            Uri uri = videoUri;
+            cleanup();
+            analyze(uri);
+        } else {
+            Uri u = videoUri;
+            cleanup();
+            if (u != null) {
+                try { getContentResolver().delete(u, null, null); } catch (Exception ignored) { }
+            }
+            log("Dibatalkan sebelum mulai merekam.");
+        }
+        recording = false;
+        locked = false;
+        setUi();
+    }
+
+    private void fail(String msg) {
+        log("GAGAL: " + msg);
+        Uri u = videoUri;
+        live = false;
         cleanup();
-        String line = analyzeLine(uri);
-        endTest(line, false);
+        if (u != null) {
+            try { getContentResolver().delete(u, null, null); } catch (Exception ignored) { }
+        }
+        recording = false;
+        locked = false;
+        setUi();
     }
 
     private void cleanup() {
@@ -659,38 +540,29 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------- analisis
 
-    private String analyzeLine(Uri uri) {
+    private void analyze(Uri uri) {
         List<long[]> f;
         synchronized (frames) { f = new ArrayList<long[]>(frames); }
         int n = f.size();
-        StringBuilder sb = new StringBuilder("OK");
+        log("--- Selesai ---");
 
-        double fileFps = -1;
-        String fileInfo = "file ?";
         if (uri != null) {
             MediaMetadataRetriever mmr = new MediaMetadataRetriever();
             try {
                 mmr.setDataSource(this, uri);
                 String fc = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT);
                 String dur = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
-                String w = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH);
-                String h = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT);
                 if (fc != null && dur != null) {
-                    double frameCount = Double.parseDouble(fc);
                     double sec = Double.parseDouble(dur) / 1000.0;
-                    fileFps = frameCount / sec;
-                    fileInfo = String.format(Locale.US, "file %.1f FPS (%s frame/%.1f dtk, %sx%s)",
-                            fileFps, fc, sec, w, h);
+                    log(String.format(Locale.US, "File: %s frame, %.1f detik, rata-rata %.1f FPS",
+                            fc, sec, Double.parseDouble(fc) / sec));
                 }
             } catch (Exception e) {
-                fileInfo = "file gagal dibaca";
+                log("Gagal membaca file video: " + e);
             } finally {
                 try { mmr.release(); } catch (Exception ignored) { }
             }
-        }
-        sb.append(" | ").append(fileInfo);
-        if (fileFps > 0) {
-            sb.append(fileFps >= 0.95 * cur.fps ? " [FPS PENUH]" : " [FPS KURANG]");
+            log("Tersimpan di Movies/HFRTest.");
         }
 
         if (n >= 3) {
@@ -701,33 +573,30 @@ public class MainActivity extends Activity {
             long med = sorted[sorted.length / 2];
             int jumps = 0;
             for (long x : d) if (x > 1.5 * med) jumps++;
-            double span = (f.get(n - 1)[0] - f.get(0)[0]) / 1e9;
-            sb.append(String.format(Locale.US, " | hasil %.1f/dtk median %.2fms lonjakan %d",
-                    (n - 1) / span, med / 1e6, jumps));
-
-            long minE = Long.MAX_VALUE, maxE = Long.MIN_VALUE;
-            long minI = Long.MAX_VALUE, maxI = Long.MIN_VALUE;
-            int zeros = 0;
-            for (long[] r : f) {
-                if (r[1] <= 0 || r[2] <= 0) { zeros++; continue; }
-                minE = Math.min(minE, r[1]); maxE = Math.max(maxE, r[1]);
-                minI = Math.min(minI, r[2]); maxI = Math.max(maxI, r[2]);
-            }
-            if (minE != Long.MAX_VALUE) {
-                sb.append(String.format(Locale.US, " | exp %.3f-%.3f ms (1/%d-1/%d s)",
-                        minE / 1e6, maxE / 1e6, 1_000_000_000L / maxE, 1_000_000_000L / minE));
-                sb.append(" | ISO ").append(minI).append("-").append(maxI);
-                if (requestedExpNs > 0) {
-                    boolean honored = Math.abs(minE - requestedExpNs) <= requestedExpNs * 0.1
-                            && Math.abs(maxE - requestedExpNs) <= requestedExpNs * 0.1;
-                    sb.append(honored ? " [MANUAL DIPATUHI]" : " [MANUAL DIABAIKAN]");
-                }
-            }
-            if (zeros > 0) sb.append(" | data nol ").append(zeros);
-        } else {
-            sb.append(" | hasil capture hanya ").append(n);
+            log(String.format(Locale.US, "Jarak frame median %.2f ms, lonjakan %d (frame terlewat/telat)",
+                    med / 1e6, jumps));
         }
-        sb.append(note);
-        return sb.toString();
+
+        if (lockIdx >= 0 && lockIdx < n) {
+            double t = (f.get(lockIdx)[0] - f.get(0)[0]) / 1e9;
+            int from = Math.min(n - 1, lockIdx + FPS / 2);
+            long lo = Long.MAX_VALUE, hi = Long.MIN_VALUE, ilo = Long.MAX_VALUE, ihi = Long.MIN_VALUE;
+            for (int i = from; i < n; i++) {
+                long e = f.get(i)[1], iso = f.get(i)[2];
+                if (e <= 0) continue;
+                lo = Math.min(lo, e); hi = Math.max(hi, e);
+                ilo = Math.min(ilo, iso); ihi = Math.max(ihi, iso);
+            }
+            log(String.format(Locale.US, "Kunci ditekan pada detik %.1f dari awal video.", t));
+            if (lo != Long.MAX_VALUE) {
+                log(String.format(Locale.US, "Setelah kunci: shutter 1/%d - 1/%d s (%.3f-%.3f ms), ISO %d-%d",
+                        Math.round(1e9 / hi), Math.round(1e9 / lo), lo / 1e6, hi / 1e6, ilo, ihi));
+                log(hi <= lo * 1.05 ? "=> STABIL. Pakai video SETELAH detik " + String.format(Locale.US, "%.1f", t + 0.5)
+                        : "=> MASIH BERUBAH. Kunci tidak sepenuhnya dipatuhi.");
+            }
+        } else {
+            log("Exposure tidak dikunci pada rekaman ini.");
+        }
+        log("");
     }
 }
